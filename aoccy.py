@@ -20,6 +20,9 @@ class ParseError(Exception):
         self.pected_len = expected_len
         self.view = view
 
+    def __str__(self):
+        return "Details below.\n" + self.format()
+
     def format(ex):
         view = ex.view
         o = []
