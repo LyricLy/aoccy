@@ -1,4 +1,5 @@
 import functools
+import itertools
 import inspect
 import re
 import resource
@@ -13,54 +14,18 @@ if hard == resource.RLIM_INFINITY:
     sys.setrecursionlimit(2**31-1)
 
 
-class ParseError(Exception):
-    def __init__(self, *, consumed, expected, expected_len=1, view=None):
-        self.consumed = consumed
-        self.pected = expected
-        self.pected_len = expected_len
-        self.view = view
-
-    def __str__(self):
-        return "Details below.\n" + self.format()
-
-    def format(ex):
-        view = ex.view
-        o = []
-        line = view[-view.column:].split("\n", 1)[0]
-        o.append(f"{view.line+1}:{view.column+1}:")
-        t = " "*len(str(view.line+1)) + " | "
-        o.append(t)
-        o.append(f"{view.line+1} | {line}")
-        o.append(t + " "*view.column + "^"*ex.pected_len)
-        if ex.pected_len:
-            unexpected = view[:ex.pected_len]
-            if unexpected:
-                o.append(f"unexpected {unexpected!r}")
-            else:
-                o.append("unexpected EOF")
-        expected = ex.pected | view.hints
-        o.append(f"expected {english_format_list(expected)}")
-        return "\n".join(o)
-
-    # INCREDIBLY evil
-    def __del__(self):
-        if self.view is not None:
-            sys.excepthook = sys.__excepthook__
-
-
 class View:
     def __init__(self, source):
         self.source = source
         self.idx = 0
         self.line = 0
         self.column = 0
-        self.hints = set()
 
     def save(self):
-        return self.idx, self.line, self.column, self.hints.copy()
+        return self.idx, self.line, self.column
 
     def load(self, data):
-        self.idx, self.line, self.column, self.hints = data
+        self.idx, self.line, self.column = data
 
     def consume(self, n):
         t = self[:n]
@@ -80,22 +45,56 @@ class View:
         else:
             return self.source[i + self.idx]
 
+
+class ParseResult:
+    __slots__ = ("result", "succeeded", "consumed", "expected")
+
+    def __init__(self, result=None, *, success, consumed=True, expected=None):
+        self.result = result
+        self.succeeded = success
+        self.consumed = consumed
+        self.expected = expected or set()
+
+
 def english_format_list(strings):
     strings = list(strings)
     if len(strings) == 1:
         return strings[0]
     return ", ".join(strings[:-1]) + ","*(len(strings)>2) + " or " + strings[-1]
 
+def format_error(view, expected):
+    o = []
+    expected_len = 1
+    line = view[-view.column:].split("\n", 1)[0]
+
+    o.append(f"{view.line+1}:{view.column+1}:")
+    t = " "*len(str(view.line+1)) + " | "
+    o.append(t)
+    o.append(f"{view.line+1} | {line}")
+    o.append(t + " "*view.column + "^"*expected_len)
+    if expected:
+        unexpected = view[:expected_len]
+        o.append(f"unexpected {unexpected!r}" if unexpected else "unexpected EOF")
+        o.append(f"expected {english_format_list(expected)}")
+    else:
+        o.append("Parsing failed (no information)")
+    return "\n".join(o)
+
+class ParseError(Exception):
+    def __str__(self):
+        return "Details below.\n" + self.args[0]
+
+    # INCREDIBLY evil
+    def __del__(self):
+        sys.excepthook = sys.__excepthook__
+
+
 class Parser:
     def __init__(self, logic):
         self.logic = logic
 
     def parse(self, view):
-        l = len(view.hints)
-        r = self.logic(view=view)
-        if len(view.hints) <= l:
-            view.hints.clear()
-        return r
+        return self.logic(view=view)
 
     def __getitem__(self, i):
         if isinstance(i, slice):
@@ -117,10 +116,10 @@ class Parser:
         return _or(cp(self), other)
 
     def __rshift__(self, other):
-        return _then(self, other).bind(lambda l: l[1])
+        return _then(self, other).map(lambda l: l[1])
 
     def __lshift__(self, other):
-        return _then(self, other).bind(lambda l: l[0])
+        return _then(self, other).map(lambda l: l[0])
 
     def __and__(self, other):
         return _then(self, other)
@@ -134,23 +133,23 @@ class Parser:
     def label(self, l):
         return _label(self, l)
 
-    def bind(self, func, *, map=False):
-        return _bind(self, func, map=map)
+    def map(self, func):
+        return _map(self, func)
 
     def set(self, val):
-        return _bind(self, lambda _: val)
+        return _map(self, lambda _: val)
 
     def parse_text(self, text):
         view = View(text)
-        try:
-            return self.parse(view)
-        except ParseError as ex:
-            ex.view = view
+        res = self.parse(view)
+        if res.succeeded:
+            return res.result
+        else:
             def except_handler(t, ex, tb):
                 sys.excepthook = sys.__excepthook__
-                print(ex.format(), file=sys.stderr)
+                print(ex.args[0], file=sys.stderr)
             sys.excepthook = except_handler
-            raise ex
+            raise ParseError(format_error(view, res.expected)) from None
 
 
 def parser(func):
@@ -162,79 +161,73 @@ def parser(func):
 
 
 @parser
-def _bind(p, func, map=False, *, view):
+def _map(p, func, *, view):
     t = p.parse(view)
-
-    res = func(t)
-
-    if not isinstance(res, Parser) or self.map:
-        # treat like <$>
-        return res
-    else:
-        # treat like >>=
-        return res.parse(view)
+    if t.succeeded:
+        t.result = func(t.result)
+    return t
 
 @parser
 def _label(p, label, *, view):
-    try:
-        return p.parse(view)
-    except ParseError as ex:
-        if ex.consumed:
-            raise
-        ex.pected = {label}
-        raise ex
+    t = p.parse(view)
+    if not t.consumed and t.expected:
+        t.expected = {label}
+    return t
 
-def _maybe_parse(p, view):
-    try:
-        return True, p.parse(view)
-    except ParseError as ex:
-        if ex.consumed:
-            raise
-        view.hints |= ex.pected
-        return False, None
+def _maybe_parse(p, view, last=None):
+    t = and_then(view, last, p)
+    if not t.succeeded:
+        if not t.consumed:
+            t.succeeded = True
+        return False, t
+    return True, t
 
 @parser
 def _between(p, low, high, *, view):
     results = []
-    high = high or float("inf")
+
     for _ in range(low):
         # we *must* succeed
-        results.append(p.parse(view))
-    count = low
-    while count < high:
-        count += 1
+        t = p.parse(view)
+        if not t.succeeded:
+            return t
+        results.append(t.result)
+
+    for _ in range(high - low) if high is not None else itertools.count():
         # we *may* succeed
-        success, res = _maybe_parse(p, view)
-        if not success:
+        res = p.parse(view)
+        if not res.succeeded:
+            if res.consumed:
+                return res
             break
-        results.append(res)
-    return results
+        results.append(res.result)
+    return ParseResult(results, success=True, consumed=bool(high), expected=res.expected)
 
 @parser
 def optional(p, *, view):
-    return _maybe_parse(p, view)[1]
+    t = p.parse(view)
+    if not t.succeeded:
+        if t.consumed:
+            return t
+        t.succeeded = True
+    return t
 
 @parser
 def lookahead(p, *, view):
     now = view.save()
-    try:
-        return p.parse(view)
-    except ParseError as ex:
-        ex.consumed = False
-        raise ex
-    finally:
-        view.load(now)
+    t = p.parse(view)
+    view.load(now)
+    t.consumed = False
+    return t
 
 @parser
 def cp(p, *, view):
     now = view.save()
-    try:
-        return p.parse(view)
-    except ParseError as ex:
-        if ex.consumed:
-            view.load(now)
-            ex.consumed = False
-        raise ex
+    t = p.parse(view)
+    if not t.succeeded and t.consumed:
+        view.load(now)
+        t.consumed = False
+    return t
 
 @parser
 def defer(f, *, view):
@@ -242,55 +235,63 @@ def defer(f, *, view):
 
 @parser
 def _or(first, second, *, view):
-    try:
-        return first.parse(view)
-    except ParseError as ex:
-        if ex.consumed:
-            raise
-        try:
-            return second.parse(view)
-        except ParseError as ex2:
-            if ex2.consumed:
-                raise
-            raise ParseError(consumed=False, expected=ex.pected|ex2.pected, expected_len=min(ex.pected_len, ex2.pected_len))
+    t1 = first.parse(view)
+    if t1.succeeded or t1.consumed:
+        return t1
+    t2 = second.parse(view)
+    if t2.succeeded or t2.consumed:
+        return t2
+
+    return ParseResult(success=False, consumed=False, expected=t1.expected|t2.expected)
 
 @parser
 def _then(first, second, *, view):
-    f = first.parse(view)
-    try:
-        s = second.parse(view)
-    except ParseError as ex:
-        ex.consumed = True
-        raise ex
-    return f, s
+    t = first.parse(view)
+    if not t.succeeded:
+        return t
+    t2 = second.parse(view)
+    t2.consumed = t2.consumed or t.consumed
+    if not t2.succeeded or t2.expected:
+        t2.expected |= t.expected
+    t2.result = t.result, t2.result
+    return t2
 
 @parser
 def lit(string, *, view):
     t = view[:len(string)]
     if t == string:
-        return view.consume(len(string))
+        return ParseResult(view.consume(len(string)), success=True)
     else:
-        raise ParseError(consumed=False, expected={repr(string)}, expected_len=len(string))
+        return ParseResult(success=False, consumed=False, expected={repr(string)})
 
 @parser
 def regex(pattern, *, view):
     m = re.match(pattern, view[:])
     if m is None:
-        raise ParseError(consumed=False, expected={f"text matching {repr(pattern)}"})
+        return ParseResult(success=False, consumed=False, expected={f"text matching {repr(pattern)}"})
     view.consume(m.end())
-    return m
+    return ParseResult(m, success=True)
 
 @parser
 def _eof(*, view):
     if view.idx == len(view.source):
-        return None
-    raise ParseError(consumed=False, expected={"EOF"})
+        return ParseResult(success=True, consumed=False)
+    return ParseResult(success=False, consumed=False, expected={"EOF"})
 eof = _eof()
 
 @parser
 def _pos(*, view):
-    return (view.line, view.column)
+    return ParseResult((view.line, view.column), success=True, consumed=False)
 pos = _pos()
+
+@parser
+def pure(v):
+    return ParseResult(v, success=True, consumed=False)
+
+@parser
+def _empty():
+    return ParseResult(success=False, consumed=False)
+empty = _empty()
 
 def lexeme_gen(ws):
     def lexeme(p):
@@ -303,7 +304,7 @@ def symbol_gen(ws):
     return symbol
 
 def sep_by(sep, p):
-    return (~(p & (sep >> p)[:])).bind(lambda p: [p[0]] + p[1] if p else [])
+    return (~(p & (sep >> p)[:])).map(lambda p: [p[0]] + p[1] if p else [])
 
 def sep_end_by(sep, p):
     return sep_by(sep, p) << ~sep
