@@ -128,7 +128,7 @@ class Parser:
         return _then(self, other)
 
     def __call__(self, func):
-        return _bind(self, func)
+        return _map(self, func)
 
     def label(self, l):
         return _label(self, l)
@@ -271,6 +271,14 @@ def regex(pattern, *, view):
         return ParseResult(success=False, consumed=False, expected={f"text matching {repr(pattern)}"})
     view.consume(m.end())
     return ParseResult(m, success=True)
+
+@parser
+def regexp(pattern, *, view):
+    m = re.match(pattern, view[:])
+    if m is None:
+        return ParseResult(success=False, consumed=False, expected={f"text matching {repr(pattern)}"})
+    view.consume(m.end())
+    return ParseResult(m.group(0), success=True)
 
 @parser
 def _eof(*, view):
